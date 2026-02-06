@@ -1,0 +1,14 @@
+pandas
+numpy
+scikit-learn
+scipy
+sqlalchemy
+psycopg2-binary
+pymongo
+fastapi
+uvicorn
+lightgbm       # optional; code will fallback to RandomForest if not present
+xgboost        # optional fallback for ranking
+pyyaml
+python-dotenv
+joblib
