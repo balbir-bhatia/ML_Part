@@ -1,130 +1,127 @@
-# src/pipelines/run_budget_and_rank.py
+# ================================================================
+#  src/pipelines/run_budget_and_rank.py  (ML ranking + NaN-safe)
+# ================================================================
 """
-Pipeline:
-  1) Load tuned LSTM checkpoint -> per-user forecast (next-period spend)
-  2) Write forecasts CSV + add column to customers.csv -> customers_with_budget.csv
-  3) Load products catalog (banking_products_sample.csv)
-  4) Build clean user features (exclude PII like address/phone/email)
-  5) Score & rank product CATEGORIES per user -> user_category_rank.csv
+Pipeline (ML ranking version):
+  1) Load tuned LSTM checkpoint → forecast next-period spend per user
+  2) Add predicted_next_spend to customers → customers_with_budget.csv
+  3) Build non-PII user features
+  4) TRAIN or LOAD ML rankers:
+        - CategoryRanker (GradientBoostingRegressor)
+        - ProductRanker  (GradientBoostingRegressor)
+     (both with in-pipeline imputers so NaNs never break training)
+  5) Predict ML scores + rank:
+        → data/features/user_category_rank_ml.csv
+        → data/features/user_product_rank_ml.csv
 
-Run:
+TRAIN:
+  python src/pipelines/run_budget_and_rank.py --train
+
+PREDICT ONLY:
   python src/pipelines/run_budget_and_rank.py
-  # with custom paths:
-  python src/pipelines/run_budget_and_rank.py ^
-    --customers data/raw/customers.csv ^
-    --transactions data/raw/transactions.csv ^
-    --products data/reference/banking_products_sample.csv ^
-    --model data/models/lstm_spend_tuned.pt
 """
 
-import os
-import argparse
-from dataclasses import dataclass
+import os, sys, argparse, warnings
+from typing import Tuple
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import StandardScaler
 
-# --- Import your tuned training helpers (same ones used for training) ---
-# If your imports differ, adjust to: from lstm_spend_tune import ...
-# Import lstm_spend_tune from src/models when running scripts from repo root
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+import joblib
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------
+# LSTM utilities import
+# ---------------------------------------------------------------------
 try:
     from src.models.lstm_spend_tune import (
         CFG, set_seed, load_data, build_period_features_daily, LSTMRegressor
     )
 except Exception:
-    # Fallback: add project root to sys.path, then import via 'models...'
-    import os, sys
-    THIS_DIR = os.path.dirname(os.path.abspath(__file__))          # .../src/pipelines
+    THIS_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
     if PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, PROJECT_ROOT)                           # add repo root
-
-    # Now src is importable as a package; import models.*
+        sys.path.insert(0, PROJECT_ROOT)
     from src.models.lstm_spend_tune import (
         CFG, set_seed, load_data, build_period_features_daily, LSTMRegressor
     )
-# -------------------- Utility: load checkpoint with scaler --------------------
+
+# ---------------- OHE wrapper for sklearn compatibility ----------------
+def make_ohe():
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+# ---------------- Safe min/max on possibly-NaN series ------------------
+def _safe_minmax(series: pd.Series):
+    arr = pd.to_numeric(series, errors="coerce").values
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return np.nan, np.nan
+    return float(np.min(arr)), float(np.max(arr))
+
+# ---------------- Load tuned LSTM checkpoint ---------------------------
 def load_ckpt(model_path: str):
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Checkpoint not found: {model_path}")
-    # PyTorch 2.6 safety: weights_only=False allowed here since it is your own file
+        raise FileNotFoundError(model_path)
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-
     scaler = StandardScaler()
-    # stored either as list or numpy arrays; coerce to np.array
     scaler.mean_  = np.array(ckpt["scaler_mean"], dtype=np.float64)
     scaler.scale_ = np.array(ckpt["scaler_scale"], dtype=np.float64)
-
     feature_cols = ckpt["feature_cols"]
-    cfg_dict = ckpt.get("cfg", {})  # training-time CFG dict
+    cfg_dict = ckpt["cfg"]
     return ckpt, scaler, feature_cols, cfg_dict
 
-
 def cfg_from_ckpt(cfg_dict: dict) -> CFG:
-    """Clone CFG with training-time hyperparams saved in checkpoint."""
     c = CFG()
     for k, v in cfg_dict.items():
         if hasattr(c, k):
             setattr(c, k, v)
     return c
 
-
-# -------------------- Forecast per user --------------------
+# ================================================================
+# 1) FORECAST NEXT-PERIOD SPEND PER USER (LSTM)
+# ================================================================
 def forecast_per_user(cfg: CFG, model_path: str):
-    """
-    Returns:
-      forecasts_df: DataFrame[customer_id, predicted_next_spend]
-      feats: per-user/day feature frame (used downstream)
-      feature_cols: list of feature columns in feats
-    """
     set_seed(cfg.seed)
-
-    # Load raw data (reuses your loader; only transactions are required here)
     tx, customers, merchants = load_data(cfg.data_dir)
 
-    # Build daily features with SAME settings used during training
-    feats, feature_cols, target_col = build_period_features_daily(
+    feats, feature_cols, _ = build_period_features_daily(
         tx,
         top_k_categories=cfg.top_k_categories,
         freq=cfg.freq,
-        outlier_cap_pct=getattr(cfg, "outlier_cap_pct", 0.99),
-        global_cap=getattr(cfg, "global_cap", True),
-        cap_floor=getattr(cfg, "cap_floor", 25.0),
+        outlier_cap_pct=cfg.outlier_cap_pct,
+        global_cap=cfg.global_cap,
+        cap_floor=cfg.cap_floor,
     )
-    feats = feats.sort_values(["customer_id", "period_start"]).reset_index(drop=True)
+    feats = feats.sort_values(["customer_id","period_start"]).reset_index(drop=True)
 
-    # Prepare last window per user
-    user_last_X, users = [], []
+    X_list, users = [], []
     for u, g in feats.groupby("customer_id"):
         g = g.sort_values("period_start")
         if len(g) < cfg.lookback:
             continue
-        X_last = g[feature_cols].values[-cfg.lookback:].astype(np.float32)  # (T,F)
-        user_last_X.append(X_last)
-        users.append(u)
-    if not user_last_X:
-        return pd.DataFrame(columns=["customer_id", "predicted_next_spend"]), feats, feature_cols
+        X_last = g[feature_cols].values[-cfg.lookback:].astype(np.float32)
+        X_list.append(X_last); users.append(u)
 
-    X = np.stack(user_last_X, axis=0)   # (B,T,F)
+    if not X_list:
+        return pd.DataFrame(columns=["customer_id","predicted_next_spend"]), feats, feature_cols
 
-    # Load checkpoint (model + scaler)
+    X = np.stack(X_list, axis=0)
     ckpt, scaler, feature_cols_ckpt, _ = load_ckpt(model_path)
     if feature_cols_ckpt != feature_cols:
-        missing = [c for c in feature_cols_ckpt if c not in feature_cols]
-        extra   = [c for c in feature_cols if c not in feature_cols_ckpt]
-        raise RuntimeError(
-            "Feature columns differ from training.\n"
-            f"In checkpoint only: {missing}\n"
-            f"In current build only: {extra}\n"
-            "Make sure productized feature builder matches training config."
-        )
+        raise RuntimeError("Feature cols mismatch with checkpoint. Retrain or align configs.")
 
-    # Scale features
     B, T, F = X.shape
     X = scaler.transform(X.reshape(B*T, F)).reshape(B, T, F).astype(np.float32)
 
-    # Build model with same dims
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LSTMRegressor(
         n_features=len(feature_cols),
@@ -136,249 +133,432 @@ def forecast_per_user(cfg: CFG, model_path: str):
     model.load_state_dict(ckpt["state"], strict=True)
     model.eval()
 
-    # Predict
     preds = []
     with torch.no_grad():
-        for i in range(0, B, 1024):
-            y_log = model(torch.from_numpy(X[i:i+1024]).to(device)).cpu().numpy().ravel()
-            y = np.expm1(y_log)  # inverse log1p -> currency
-            preds.append(y)
+        for i in range(0, B, 512):
+            batch = torch.from_numpy(X[i:i+512]).to(device)
+            y_log = model(batch).cpu().numpy().ravel()
+            preds.append(np.expm1(y_log))
     preds = np.concatenate(preds)
 
-    forecasts_df = pd.DataFrame({"customer_id": users, "predicted_next_spend": preds.round(2)})
-    return forecasts_df, feats, feature_cols
+    df = pd.DataFrame({
+        "customer_id": [str(u) for u in users],
+        "predicted_next_spend": preds.round(2)
+    })
+    return df, feats, feature_cols
 
-
-# -------------------- Update customers.csv with forecast --------------------
-def update_customers_with_budget(customers_path: str, forecasts_df: pd.DataFrame, out_path: str):
+# ================================================================
+# 2) UPDATE CUSTOMERS WITH BUDGET
+# ================================================================
+def update_customers_with_budget(customers_path, forecasts_df, out_path):
     customers = pd.read_csv(customers_path)
-    # unify types for merge
     customers["customer_id"] = customers["customer_id"].astype(str)
     forecasts_df["customer_id"] = forecasts_df["customer_id"].astype(str)
-
-    updated = customers.merge(forecasts_df, on="customer_id", how="left")
+    merged = customers.merge(forecasts_df, on="customer_id", how="left")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    updated.to_csv(out_path, index=False)
-    return updated
+    merged.to_csv(out_path, index=False)
+    return merged
 
+# ================================================================
+# 3) LOAD PRODUCTS
+# ================================================================
+def load_products(path: str):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    for c in ["product_category","sub_category"]:
+        if c in df: df[c] = df[c].astype(str)
+    for c in ["example_amount","account_balance","current_credit_limit","interest_rate","loan_term_months","rewards_points"]:
+        if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-# -------------------- Load products catalog --------------------
-def load_products(products_path: str):
-    if not os.path.exists(products_path):
-        raise FileNotFoundError(f"Products CSV not found: {products_path}")
-    products = pd.read_csv(products_path)
-    # Normalize column names
-    products.columns = [c.strip().lower().replace(" ", "_") for c in products.columns]
-    # We’ll keep category and sub-category as strings
-    for c in ["product_category", "sub_category"]:
-        if c in products.columns:
-            products[c] = products[c].astype(str)
-    return products
-
-
-# -------------------- Build compact user features for ranking --------------------
+# ================================================================
+# 4) BUILD NON-PII USER PROFILE
+# ================================================================
 def build_user_profile(customers_with_budget: pd.DataFrame,
                        transactions_path: str,
                        lookback_days: int = 30):
-    """
-    Returns user_features with columns:
-      customer_id, age, gender, city, segment, current_balance, predicted_next_spend,
-      txn_count_30d, total_30d, avg_amt_30d, max_amt_30d
-    Drops PII-like columns (address, contact_number, email).
-    """
-    # Keep non-PII columns if present
-    keep_cols = ["customer_id", "age", "gender", "city", "segment",
-                 "current_balance", "predicted_next_spend"]
-    keep_cols = [c for c in keep_cols if c in customers_with_budget.columns]
-
-    users = customers_with_budget[keep_cols].copy()
+    keep = ["customer_id","age","gender","city","segment","current_balance","predicted_next_spend"]
+    keep = [c for c in keep if c in customers_with_budget.columns]
+    users = customers_with_budget[keep].copy()
     users["customer_id"] = users["customer_id"].astype(str)
 
-    # Transactions aggregation (last N days)
     tx = pd.read_csv(transactions_path)
-    # normalize types
     if "transaction_ts" in tx.columns:
         tx["transaction_ts"] = pd.to_datetime(tx["transaction_ts"], errors="coerce")
-    elif "transaction_date" in tx.columns:
-        tx["transaction_ts"] = pd.to_datetime(tx["transaction_date"], errors="coerce")
     else:
-        raise ValueError("transactions.csv must have 'transaction_ts' or 'transaction_date'")
-
-    tx["amount"] = pd.to_numeric(tx["amount"], errors="coerce").fillna(0.0)
+        tx["transaction_ts"] = pd.to_datetime(tx["transaction_date"], errors="coerce")
     tx["customer_id"] = tx["customer_id"].astype(str)
+    tx["amount"] = pd.to_numeric(tx["amount"], errors="coerce").fillna(0.0)
 
     cutoff = tx["transaction_ts"].max() - pd.Timedelta(days=lookback_days)
-    tx30 = tx[tx["transaction_ts"] >= cutoff].copy()
+    tx = tx[tx["transaction_ts"] >= cutoff]
 
-    agg = tx30.groupby("customer_id")["amount"].agg(
-        txn_count_30d = "count",
-        total_30d = "sum",
-        max_amt_30d = "max",
+    ag = tx.groupby("customer_id")["amount"].agg(
+        txn_count_30d="count",
+        total_30d="sum",
+        max_amt_30d="max"
     ).reset_index()
-    agg["avg_amt_30d"] = (agg["total_30d"] / agg["txn_count_30d"]).replace([np.inf, -np.inf], 0).fillna(0)
+    ag["avg_amt_30d"] = (ag["total_30d"] / ag["txn_count_30d"]).replace([np.inf,-np.inf],0)
 
-    user_features = users.merge(agg, on="customer_id", how="left")
-    for c in ["txn_count_30d","total_30d","max_amt_30d","avg_amt_30d","predicted_next_spend","current_balance"]:
-        if c in user_features.columns:
-            user_features[c] = pd.to_numeric(user_features[c], errors="coerce").fillna(0.0)
+    users = users.merge(ag, on="customer_id", how="left")
+    for c in ["txn_count_30d","total_30d","avg_amt_30d","max_amt_30d","current_balance","predicted_next_spend","age"]:
+        if c in users: users[c] = pd.to_numeric(users[c], errors="coerce").fillna(0)
 
-    # Age cleanup if present
-    if "age" in user_features.columns:
-        user_features["age"] = pd.to_numeric(user_features["age"], errors="coerce").fillna(0.0)
+    if "city" in users:
+        top = users["city"].value_counts().head(30).index
+        users["city"] = users["city"].where(users["city"].isin(top), "other")
 
-    # Fill missing categoricals
     for c in ["gender","city","segment"]:
-        if c in user_features.columns:
-            user_features[c] = user_features[c].fillna("unknown").astype(str)
+        if c in users: users[c] = users[c].fillna("unknown").astype(str)
 
-    return user_features
+    return users
 
-
-# -------------------- Category ranking model (deterministic scoring) --------------------
-def pick_product_amount(row: pd.Series) -> float:
-    """
-    Choose a monetary anchor from the products row.
-    Preference order: example_amount -> account_balance -> current_credit_limit
-    """
-    for key in ["example_amount", "account_balance", "current_credit_limit"]:
-        if key in row.index:
-            v = pd.to_numeric(row[key], errors="coerce")
-            if pd.notna(v):
-                return float(v)
+# ================================================================
+# 5) TEACHER (HEURISTICS) FOR PSEUDO-LABELS
+# ================================================================
+def _anchor_amount(row):
+    for k in ["example_amount","account_balance","current_credit_limit"]:
+        v = row.get(k, np.nan)
+        if pd.notna(v): return float(v)
     return np.nan
 
+def _normalize_closeness(x, ref, eps=1e-6):
+    if ref is None or np.isnan(ref): return 0
+    return max(0.0, 1 - abs(float(x)-float(ref)) / (abs(float(ref))+eps))
 
-def normalize_closeness(x, ref, eps=1e-6):
-    """Return closeness in [0,1]: 1 - |x-ref|/(|ref|+eps). If ref is nan, return 0."""
-    if ref is None or np.isnan(ref):
-        return 0.0
-    return float(max(0.0, 1.0 - (abs(float(x) - float(ref)) / (abs(float(ref)) + eps))))
+def teacher_category_score(u, cat_anchor, category):
+    ref = cat_anchor.get(category, np.nan)
+    def clos(x): return _normalize_closeness(x, ref)
 
+    u_b  = float(u.get("predicted_next_spend",0))
+    u_bal= float(u.get("current_balance",0))
+    u_tx = float(u.get("txn_count_30d",0))
+    u_av = float(u.get("avg_amt_30d",0))
+    u_mx = float(u.get("max_amt_30d",0))
+    u_ag = float(u.get("age",0))
 
-def compute_category_scores(user_row: pd.Series, products: pd.DataFrame) -> pd.DataFrame:
-    """
-    Score each top-level product_category for a single user.
-    Heuristic, fast, label-free. Uses user's budget/balance/activity vs product anchors.
-    """
-    # Pre-calc per category anchor amount (median of available rows)
-    products = products.copy()
-    for c in ["example_amount","account_balance","current_credit_limit"]:
-        if c in products.columns:
-            products[c] = pd.to_numeric(products[c], errors="coerce")
+    budget_fit = clos(u_b)
+    bal_fit    = clos(u_bal)
+    activity   = min(1.0,u_tx/30)*0.5 + min(1.0,u_av/(ref+1e-6))*0.5
 
-    products["anchor_amount"] = products.apply(pick_product_amount, axis=1)
-    cat_anchor = products.groupby("product_category")["anchor_amount"].median().to_dict()
+    cat_l = category.lower()
+    if cat_l.startswith("loan"):       return 0.45*clos(u_mx) + 0.35*(1-bal_fit) + 0.20*activity
+    if cat_l.startswith("investment"): return 0.65*bal_fit + 0.25*budget_fit + 0.10*activity
+    if cat_l.startswith("savings"):    return 0.50*bal_fit + 0.30*activity + 0.20*budget_fit
+    if cat_l.startswith("insurance"):  return 0.60*min(1.0,u_ag/70) + 0.20*activity + 0.20*budget_fit
+    if cat_l.startswith("credit card"):return 0.50*budget_fit + 0.50*min(1.0,u_av/(ref+1e-6))
+    return 0.6*budget_fit + 0.4*activity
 
-    u_budget = float(user_row.get("predicted_next_spend", 0.0) or 0.0)
-    u_balance = float(user_row.get("current_balance", 0.0) or 0.0)
-    u_txn_count = float(user_row.get("txn_count_30d", 0.0) or 0.0)
-    u_avg = float(user_row.get("avg_amt_30d", 0.0) or 0.0)
-    u_total = float(user_row.get("total_30d", 0.0) or 0.0)
-    u_max = float(user_row.get("max_amt_30d", 0.0) or 0.0)
-    u_age = float(user_row.get("age", 0.0) or 0.0)
+# ================================================================
+# BUILD CANDIDATES
+# ================================================================
+def build_cat_candidates(user_features, products):
+    pr = products.copy()
+    pr["anchor"] = products.apply(_anchor_amount, axis=1)
+    cat_anchor = pr.groupby("product_category")["anchor"].median().to_dict()
 
     rows = []
-    for category in sorted(products["product_category"].unique()):
-        ref_amt = cat_anchor.get(category, np.nan)
+    for _, u in user_features.iterrows():
+        for c in sorted(products["product_category"].unique()):
+            rows.append({
+                "customer_id": u["customer_id"],
+                "product_category": c,
+                "predicted_next_spend": u["predicted_next_spend"],
+                "current_balance": u["current_balance"],
+                "txn_count_30d": u["txn_count_30d"],
+                "avg_amt_30d": u["avg_amt_30d"],
+                "total_30d": u["total_30d"],
+                "max_amt_30d": u["max_amt_30d"],
+                "age": u["age"],
+                "gender": u["gender"],
+                "city": u["city"],
+                "segment": u["segment"],
+                "cat_anchor": cat_anchor.get(c, np.nan),
+                "y_cat": teacher_category_score(u, cat_anchor, c)
+            })
+    return pd.DataFrame(rows)
 
-        # Base components
-        budget_fit = normalize_closeness(u_budget, ref_amt)
-        balance_fit = normalize_closeness(u_balance, ref_amt)
-        activity_fit = min(1.0, (u_txn_count / 30.0)) * 0.5 + min(1.0, (u_avg / (ref_amt + 1e-6))) * 0.5
+def build_product_candidates(user_features, products):
+    # Precompute category stats (safe)
+    cat_stats = {}
+    for cat, g in products.groupby("product_category"):
+        rmin,rmax = _safe_minmax(g["interest_rate"]) if "interest_rate" in g else (np.nan,np.nan)
+        wmin,wmax = _safe_minmax(g["rewards_points"]) if "rewards_points" in g else (np.nan,np.nan)
+        cat_stats[cat] = {"rate_min":rmin,"rate_max":rmax,"rew_min":wmin,"rew_max":wmax}
 
-        # Category-specific blend (simple but effective)
-        if category.lower().startswith("loan"):
-            # Loans: larger amounts align with higher max spend; users with low balance vs anchor also score
-            score = 0.45 * normalize_closeness(u_max, ref_amt) + 0.35 * (1 - normalize_closeness(u_balance, ref_amt)) + 0.20 * activity_fit
-        elif category.lower().startswith("investment"):
-            # Investments: high balance + decent budget
-            score = 0.65 * balance_fit + 0.25 * budget_fit + 0.10 * activity_fit
-        elif category.lower().startswith("savings"):
-            # Savings: reasonable balance & active transactions
-            score = 0.50 * balance_fit + 0.30 * activity_fit + 0.20 * budget_fit
-        elif category.lower().startswith("insurance"):
-            # Insurance: age & recent activity
-            age_factor = min(1.0, u_age / 70.0)
-            score = 0.60 * age_factor + 0.20 * activity_fit + 0.20 * budget_fit
-        elif category.lower().startswith("credit card"):
-            # Cards: budget close to credit anchors + average txn size
-            score = 0.50 * budget_fit + 0.50 * min(1.0, u_avg / (ref_amt + 1e-6))
-        else:
-            # Fallback: budget + activity
-            score = 0.6 * budget_fit + 0.4 * activity_fit
+    def teacher_prod(u,p):
+        cat = p["product_category"]
+        ref = _anchor_amount(p)
+        def clos(x): return _normalize_closeness(x, ref)
 
-        rows.append({"product_category": category, "score": float(score)})
+        u_b  = float(u["predicted_next_spend"])
+        u_bal= float(u["current_balance"])
+        u_tx = float(u["txn_count_30d"])
+        u_av = float(u["avg_amt_30d"])
+        u_mx = float(u["max_amt_30d"])
+        u_ag = float(u["age"])
 
-    out = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
-    out["rank"] = out["score"].rank(method="dense", ascending=False).astype(int)
-    return out
+        budget_fit = clos(u_b)
+        bal_fit    = clos(u_bal)
+        activity   = min(1.0,u_tx/30)
+        st         = cat_stats.get(cat, {})
+        rate,term,rews = p.get("interest_rate"),p.get("loan_term_months"),p.get("rewards_points")
 
+        def _scale(v,vmin,vmax,inv=False):
+            if v is None or np.isnan(v) or np.isnan(vmin) or np.isnan(vmax) or vmax<=vmin:
+                return 0
+            r=(v-vmin)/(vmax-vmin); r=max(0,min(1,r))
+            return 1-r if inv else r
 
-def rank_categories_for_all_users(user_features: pd.DataFrame, products: pd.DataFrame) -> pd.DataFrame:
-    records = []
-    for _, urow in user_features.iterrows():
-        per_cat = compute_category_scores(urow, products)
-        per_cat["customer_id"] = urow["customer_id"]
-        records.append(per_cat)
-    if not records:
-        return pd.DataFrame(columns=["customer_id","product_category","score","rank"])
-    res = pd.concat(records, ignore_index=True)
-    # order columns
-    return res[["customer_id","product_category","score","rank"]]
+        if cat.lower().startswith("loan"):
+            rate_s=_scale(rate,st["rate_min"],st["rate_max"],inv=True)
+            term_pref=1 - min(1, abs((term or 36)-36)/36)
+            amt_fit=0.55*clos(u_mx)+0.45*budget_fit
+            return 0.5*amt_fit+0.35*rate_s+0.15*term_pref
+        if cat.lower().startswith("investment"):
+            return 0.55*bal_fit+0.25*budget_fit+0.20*activity
+        if cat.lower().startswith("savings"):
+            senior=0.1 if ("senior" in str(p["sub_category"]).lower() and u_ag>=60) else 0
+            return 0.55*bal_fit+0.25*activity+0.20*budget_fit+senior
+        if cat.lower().startswith("insurance"):
+            age_f=min(1,u_ag/70)
+            return 0.60*age_f+0.20*activity+0.20*budget_fit
+        if cat.lower().startswith("credit card"):
+            limit_fit=clos(u_av*25)
+            rew_s=_scale(rews,st["rew_min"],st["rew_max"])
+            return 0.55*limit_fit+0.45*rew_s
+        return 0.6*budget_fit+0.4*activity
 
+    rows = []
+    for _, u in user_features.iterrows():
+        for _, p in products.iterrows():
+            rows.append({
+                "customer_id": u["customer_id"],
+                "product_category": p["product_category"],
+                "sub_category": p["sub_category"],
+                "predicted_next_spend": u["predicted_next_spend"],
+                "current_balance": u["current_balance"],
+                "txn_count_30d": u["txn_count_30d"],
+                "avg_amt_30d": u["avg_amt_30d"],
+                "total_30d": u["total_30d"],
+                "max_amt_30d": u["max_amt_30d"],
+                "age": u["age"],
+                "gender": u["gender"],
+                "city": u["city"],
+                "segment": u["segment"],
+                "example_amount": p["example_amount"],
+                "current_credit_limit": p["current_credit_limit"],
+                "account_balance": p["account_balance"],
+                "interest_rate": p["interest_rate"],
+                "loan_term_months": p["loan_term_months"],
+                "rewards_points": p["rewards_points"],
+                "eligibility_status": str(p["eligibility_status"]),
+                "y_prod": teacher_prod(u,p)
+            })
+    return pd.DataFrame(rows)
 
-# -------------------- Main CLI --------------------
+# ================================================================
+# 6) TRAIN ML MODELS (with in-pipeline IMPUTERS)
+# ================================================================
+def train_category_ranker(cat_df, model_path):
+    num_cols = ["predicted_next_spend","current_balance","txn_count_30d",
+                "avg_amt_30d","total_30d","max_amt_30d","age","cat_anchor"]
+    cat_cols = ["product_category","gender","city","segment"]
+
+    pre = ColumnTransformer([
+        ("num", Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("sc",  StandardScaler())
+        ]), num_cols),
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("ohe", make_ohe())
+        ]), cat_cols)
+    ])
+
+    model = GradientBoostingRegressor(
+        n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42
+    )
+    pipe = Pipeline([("pre", pre), ("gbr", model)])
+
+    X = cat_df[num_cols + cat_cols]
+    y = cat_df["y_cat"].fillna(0.0)
+
+    pipe.fit(X, y)
+    joblib.dump(pipe, model_path)
+    print("✓ CategoryRanker trained:", model_path)
+    return pipe
+
+def train_product_ranker(prod_df, model_path):
+    num_cols = ["predicted_next_spend","current_balance","txn_count_30d","avg_amt_30d",
+                "total_30d","max_amt_30d","age",
+                "example_amount","current_credit_limit","account_balance",
+                "interest_rate","loan_term_months","rewards_points"]
+    cat_cols = ["product_category","sub_category","gender","city","segment","eligibility_status"]
+
+    pre = ColumnTransformer([
+        ("num", Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("sc",  StandardScaler())
+        ]), [c for c in num_cols if c in prod_df.columns]),
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("ohe", make_ohe())
+        ]), [c for c in cat_cols if c in prod_df.columns])
+    ])
+
+    model = GradientBoostingRegressor(
+        n_estimators=250, max_depth=3, learning_rate=0.05, random_state=42
+    )
+    pipe = Pipeline([("pre", pre), ("gbr", model)])
+
+    X = prod_df[[c for c in num_cols if c in prod_df.columns] + [c for c in cat_cols if c in prod_df.columns]]
+    y = prod_df["y_prod"].fillna(0.0)
+
+    pipe.fit(X, y)
+    joblib.dump(pipe, model_path)
+    print("✓ ProductRanker trained:", model_path)
+    return pipe
+
+def load_or_train(user_features, products, force_train=False):
+    model_dir = "data/models"
+    os.makedirs(model_dir, exist_ok=True)
+
+    cat_model_path = os.path.join(model_dir, "category_ranker.pkl")
+    prod_model_path = os.path.join(model_dir, "product_ranker.pkl")
+
+    if force_train or (not os.path.exists(cat_model_path) or not os.path.exists(prod_model_path)):
+        print("→ Generating training data (user × category, user × product) ...")
+        cat_df = build_cat_candidates(user_features, products)
+        prod_df = build_product_candidates(user_features, products)
+        print(f"Training pairs: category={len(cat_df):,}, product={len(prod_df):,}")
+        cat_model = train_category_ranker(cat_df, cat_model_path)
+        prod_model = train_product_ranker(prod_df, prod_model_path)
+    else:
+        print("→ Loading pre-trained rankers ...")
+        cat_model = joblib.load(cat_model_path)
+        prod_model = joblib.load(prod_model_path)
+
+    return cat_model, prod_model
+
+# ================================================================
+# 7) PREDICT & RANK
+# ================================================================
+def rank_categories_ml(cat_model, user_features, products):
+    pr = products.copy()
+    pr["anchor"] = products.apply(_anchor_amount, axis=1)
+    cat_anchor = pr.groupby("product_category")["anchor"].median().to_dict()
+
+    rows = []
+    cats = sorted(products["product_category"].unique())
+    for _, u in user_features.iterrows():
+        for c in cats:
+            rows.append({
+                "customer_id": u["customer_id"],
+                "product_category": c,
+                "predicted_next_spend": u["predicted_next_spend"],
+                "current_balance": u["current_balance"],
+                "txn_count_30d": u["txn_count_30d"],
+                "avg_amt_30d": u["avg_amt_30d"],
+                "total_30d": u["total_30d"],
+                "max_amt_30d": u["max_amt_30d"],
+                "age": u["age"],
+                "gender": u["gender"],
+                "city": u["city"],
+                "segment": u["segment"],
+                "cat_anchor": cat_anchor.get(c,np.nan)
+            })
+    df = pd.DataFrame(rows)
+    X = df[["predicted_next_spend","current_balance","txn_count_30d","avg_amt_30d",
+            "total_30d","max_amt_30d","age","cat_anchor",
+            "product_category","gender","city","segment"]]
+    df["score"] = cat_model.predict(X)
+    df["rank"] = df.groupby("customer_id")["score"].rank(method="dense", ascending=False).astype(int)
+    return df.sort_values(["customer_id","rank","product_category"])
+
+def rank_products_ml(prod_model, user_features, products, topk=3):
+    rows = []
+    for _, u in user_features.iterrows():
+        for _, p in products.iterrows():
+            rows.append({
+                "customer_id": u["customer_id"],
+                "product_category": p["product_category"],
+                "sub_category": p["sub_category"],
+                "predicted_next_spend": u["predicted_next_spend"],
+                "current_balance": u["current_balance"],
+                "txn_count_30d": u["txn_count_30d"],
+                "avg_amt_30d": u["avg_amt_30d"],
+                "total_30d": u["total_30d"],
+                "max_amt_30d": u["max_amt_30d"],
+                "age": u["age"],
+                "gender": u["gender"],
+                "city": u["city"],
+                "segment": u["segment"],
+                "example_amount": p["example_amount"],
+                "current_credit_limit": p["current_credit_limit"],
+                "account_balance": p["account_balance"],
+                "interest_rate": p["interest_rate"],
+                "loan_term_months": p["loan_term_months"],
+                "rewards_points": p["rewards_points"],
+                "eligibility_status": str(p["eligibility_status"]),
+            })
+    df = pd.DataFrame(rows)
+    X = df[["predicted_next_spend","current_balance","txn_count_30d","avg_amt_30d",
+            "total_30d","max_amt_30d","age",
+            "example_amount","current_credit_limit","account_balance",
+            "interest_rate","loan_term_months","rewards_points",
+            "product_category","sub_category","gender","city","segment","eligibility_status"]]
+    df["product_score"] = prod_model.predict(X)
+    df["rank"] = df.groupby(["customer_id","product_category"])["product_score"]\
+                   .rank(method="dense", ascending=False).astype(int)
+    if topk:
+        df = df[df["rank"] <= topk]
+    return df.sort_values(["customer_id","product_category","rank","sub_category"])
+
+# ================================================================
+# MAIN
+# ================================================================
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--customers", default="data/raw/customers.csv")
-    p.add_argument("--transactions", default="data/raw/transactions.csv")
-    p.add_argument("--products", default="data/reference/banking_products_sample.csv")
-    p.add_argument("--model", default="data/models/lstm_spend_tuned.pt")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--customers", default="data/raw/customers.csv")
+    ap.add_argument("--transactions", default="data/raw/transactions.csv")
+    ap.add_argument("--products", default="data/reference/banking_products_sample.csv")
+    ap.add_argument("--model", default="data/models/lstm_spend_tuned.pt")
+    ap.add_argument("--topk", type=int, default=3)
+    ap.add_argument("--train", action="store_true")
+    args = ap.parse_args()
 
-    # 1) Load model cfg + forecast
+    # 1) Forecast
     ckpt, _, _, cfg_dict = load_ckpt(args.model)
     cfg = cfg_from_ckpt(cfg_dict)
-
     print("→ Forecasting next-period spend per user ...")
     forecasts_df, feats, feature_cols = forecast_per_user(cfg, args.model)
-
-    # write forecasts for downstream systems
     os.makedirs("data/features", exist_ok=True)
-    forecasts_path = "data/features/user_forecast_spend_tuned.csv"
-    forecasts_df.to_csv(forecasts_path, index=False)
-    print(f"✓ Saved forecasts: {forecasts_path} (rows={len(forecasts_df)})")
+    forecasts_df.to_csv("data/features/user_forecast_spend_tuned.csv", index=False)
 
-    # 2) Update customers with budget column
-    print("→ Updating customers.csv with predicted_next_spend ...")
-    updated_customers_path = "data/raw/customers_with_budget.csv"
-    updated_customers = update_customers_with_budget(args.customers, forecasts_df, updated_customers_path)
-    print(f"✓ Saved: {updated_customers_path} (rows={len(updated_customers)})")
+    # 2) Update customers
+    updated_customers = update_customers_with_budget(args.customers, forecasts_df, "data/raw/customers_with_budget.csv")
 
-    # 3) Products
+    # 3) Load products
     products = load_products(args.products)
-    print(f"→ Loaded products: {args.products}, categories={products['product_category'].nunique()}")
 
-    # 4) Build compact user features (drop PII, add activity features)
-    print("→ Building user features for ranking ...")
-    user_features = build_user_profile(updated_customers, args.transactions, lookback_days=30)
-    print(f"✓ Users with features: {len(user_features)}")
+    # 4) User features
+    user_features = build_user_profile(updated_customers, args.transactions)
 
-    # 5) Rank product categories per user
-    print("→ Scoring & ranking product categories per user ...")
-    ranks = rank_categories_for_all_users(user_features, products)
+    # 5) Load/train rankers
+    cat_model, prod_model = load_or_train(user_features, products, force_train=args.train)
 
-    out_rank = "data/features/user_category_rank.csv"
-    os.makedirs(os.path.dirname(out_rank), exist_ok=True)
-    ranks.to_csv(out_rank, index=False)
-    print(f"✓ Saved category ranks: {out_rank} (rows={len(ranks)})")
+    # 6) Predict category ranks
+    print("→ Predicting category ranks ...")
+    cat_scores = rank_categories_ml(cat_model, user_features, products)
+    cat_scores.to_csv("data/features/user_category_rank_ml.csv", index=False)
 
-    # Show a small preview
-    print("\nTop-3 sample (first user):")
-    if len(ranks) > 0:
-        first_user = ranks["customer_id"].iloc[0]
-        print(ranks[ranks["customer_id"]==first_user].sort_values("rank").head(3))
+    # 7) Predict product ranks
+    print("→ Predicting product ranks ...")
+    prod_scores = rank_products_ml(prod_model, user_features, products, topk=args.topk)
+    prod_scores.to_csv("data/features/user_product_rank_ml.csv", index=False)
 
+    print("\n✓ DONE")
 
 if __name__ == "__main__":
     main()
