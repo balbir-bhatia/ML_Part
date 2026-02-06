@@ -1,0 +1,21 @@
+product_category,sub_category,example_amount,interest_rate,loan_term_months,account_balance,current_credit_limit,card_type,rewards_points,eligibility_status
+Loan,Personal Loan,100000.0,10.5,36.0,,,,,Eligible
+Loan,Home Loan,50000.0,8.5,24.0,,,,,Eligible
+Loan,Auto Loan,300000.0,9.0,48.0,,,,,Eligible
+Loan,Education Loan,200000.0,7.5,60.0,,,,,Eligible
+Loan,Business / SME Loan,500000.0,11.0,72.0,,,,,Eligible
+Investment Services,Premium Membership,,,,100000.0,,,,Eligible
+Investment Services,Mutual Funds,,,,150000.0,,,,Eligible
+Investment Services,Fixed Deposits,,,,200000.0,,,,Eligible
+Investment Services,Wealth Management Services,,,,500000.0,,,,Eligible
+Savings Account,Standard Savings Account,,,,50000.0,,,,Eligible
+Savings Account,High-Yield Savings Account,,,,200000.0,,,,Eligible
+Savings Account,Senior Citizen Savings Account,,,,300000.0,,,,Eligible
+Insurance,Life Insurance,,,,150000.0,,,,Eligible
+Insurance,Health Insurance,,,,100000.0,,,,Eligible
+Insurance,Term Insurance,,,,120000.0,,,,Eligible
+Insurance,Family / Child Plans,,,,200000.0,,,,Eligible
+Credit Card,Standard Card,,,,,20000.0,Standard,5000.0,Eligible
+Credit Card,Gold Card,,,,,40000.0,Gold,8000.0,Eligible
+Credit Card,Platinum Card,,,,,50000.0,Platinum,12000.0,Eligible
+Credit Card,Rewards / Cashback Card,,,,,30000.0,Rewards,7000.0,Eligible

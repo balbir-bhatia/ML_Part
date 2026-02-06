@@ -1,7 +1,7 @@
 # src/models/lstm_spend_tune.py
-# Fine-tuned LSTM for user spend forecasting with user-balanced batching.
+# Fine-tuned LSTM for user spend forecasting with user-balanced batching (fast-friendly).
 
-import os, json, math, random
+import os, json, math, random, time
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 import numpy as np
@@ -12,13 +12,17 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 from sklearn.preprocessing import StandardScaler
 
-# ---- Import existing helpers (keep as is if this works in your env) ----
-# If your imports differ, you can switch to: from src.models.lstm_spend import ...
-from lstm_spend import load_data, add_time_cyc_features, set_seed
+# ---- Import existing helpers (adjust import path if needed) ----
+try:
+    # if this works in your environment (as before)
+    from lstm_spend import load_data, add_time_cyc_features, set_seed
+except Exception:
+    # fallback if your package layout is src.models.lstm_spend
+    from src.models.lstm_spend import load_data, add_time_cyc_features, set_seed
 
 
 # =========================
-# Config
+# Config (defaults tuned for speed)
 # =========================
 @dataclass
 class CFG:
@@ -28,38 +32,50 @@ class CFG:
 
     # time & sequence
     freq: str = "D"          # daily aggregation
-    lookback: int = 28       # last 28 days -> predict next day
+    lookback: int = 21       # shorter than 28 -> more sequences, faster
     horizon: int = 1
 
-    # training
+    # training (fast-friendly defaults)
     batch_size: int = 128
-    epochs: int = 30
+    epochs: int = 12
     lr: float = 5e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     seed: int = 42
 
     # features
-    top_k_categories: int = 10
-    outlier_cap_pct: float = 0.99      # cap daily total at 99th pct (and add flag)
+    top_k_categories: int = 12
+    outlier_cap_pct: float = 0.99     # global cap percentile
+    global_cap: bool = True           # <<< NEW: use global cap after concat
+    cap_floor: float = 25.0           # <<< NEW: min cap to avoid collapse
 
-    # model
-    hidden_size: int = 96
+    # model (smaller hidden for speed)
+    hidden_size: int = 64
     num_layers: int = 2
-    dropout: float = 0.25
+    dropout: float = 0.20
 
     # early stop / lr schedule
-    es_patience: int = 6
+    es_patience: int = 5
     lr_patience: int = 3
     min_delta: float = 1e-3
 
-    # ---- NEW: User-balanced batching controls ----
-    sampler: str = "weighted"          # "weighted" | "grouped" | "none"
-    cap_train_sequences_per_user: int | None = None  # e.g., 1000 to cap; None to disable
+    # ---- User-balanced batching controls ----
+    sampler: str = "weighted"       # "weighted" | "grouped" | "none"
+    cap_train_sequences_per_user: int | None = None  # e.g., 800; None disables
 
     # grouped sampler params (used when sampler=="grouped")
     users_per_batch: int = 8
-    seqs_per_user: int = 16            # users_per_batch * seqs_per_user == batch_size
+    seqs_per_user: int = 16         # users_per_batch * seqs_per_user == batch_size
+
+    # ---- FAST MODE switches (to make training quick on laptops) ----
+    fast_mode: bool = True          # turn off for full training
+    # limit number of train sequences globally (after split & scaling)
+    max_train_sequences: int | None = 15000
+    # optionally keep only top-N users by sequence count (None disables)
+    keep_top_users: int | None = 1200
+    # multi-worker data loader (set 0 on Windows if you hit issues)
+    num_workers: int = 0            # Windows: often 0 is safest
+    pin_memory: bool = False
 
 
 # =========================
@@ -75,10 +91,8 @@ def parse_items(items):
     if isinstance(items, str):
         try:
             val = json.loads(items)
-            if isinstance(val, list):
-                return val
-            if isinstance(val, dict):
-                return [val]
+            if isinstance(val, list): return val
+            if isinstance(val, dict): return [val]
         except Exception:
             return []
     return []
@@ -91,13 +105,20 @@ def ensure_ts(df: pd.DataFrame):
             return c
     raise ValueError("No timestamp column found in transactions.")
 
-def build_period_features_daily(tx: pd.DataFrame, top_k_categories: int = 10, freq: str = "D", outlier_cap_pct: float = 0.99):
+def build_period_features_daily(
+    tx: pd.DataFrame,
+    top_k_categories: int = 10,
+    freq: str = "D",
+    outlier_cap_pct: float = 0.99,
+    global_cap: bool = True,
+    cap_floor: float = 25.0,
+):
     """
     Aggregate to (user, day):
       - base: total_amount, txn_count, avg_amount
       - category share (top-K + other)
       - lags/EMAs/std: lag1, lag7, ema3, ema7, std7
-      - optional outlier cap + flag (improves stability)
+      - GLOBAL outlier cap + flag (improves stability, avoids per-user collapse)
       - time cyclic features
     """
     ts_col = ensure_ts(tx)
@@ -114,32 +135,31 @@ def build_period_features_daily(tx: pd.DataFrame, top_k_categories: int = 10, fr
 
     df["category"] = df["items_parsed"].apply(get_cat)
 
+    # top-K categories by global frequency
     top_cats = df["category"].value_counts().head(top_k_categories).index.tolist()
 
     feats = []
     for u, g in df.groupby("customer_id"):
         g = g.sort_values(ts_col).set_index(ts_col)
 
+        # base daily aggregates
         base = g["amount"].resample(freq).agg(["sum", "count", "mean"]).rename(
             columns={"sum": "total_amount", "count": "txn_count", "mean": "avg_amount"}
         ).fillna(0.0)
 
-        # outlier cap + flag on daily total
-        if len(base) > 0:
-            q = base["total_amount"].quantile(outlier_cap_pct)
-        else:
-            q = 0.0
-        base["outlier_day"] = (base["total_amount"] > q).astype(float)
-        base["total_amount"] = np.minimum(base["total_amount"], q if q > 0 else base["total_amount"])
-
-        # category shares
+        # category share features (other = not in top-K)
         g2 = g.assign(cat=lambda x: np.where(x["category"].isin(top_cats), x["category"], "other"))
-        cat_amt = g2.groupby([pd.Grouper(freq=freq), "cat"])["amount"].sum().unstack(fill_value=0.0)
+        cat_amt = (
+            g2.groupby([pd.Grouper(freq=freq), "cat"])["amount"]
+              .sum()
+              .unstack(fill_value=0.0)
+        )
         cat_frac = cat_amt.div(cat_amt.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
 
+        # join base + category shares
         X = base.join(cat_frac, how="outer").fillna(0.0)
 
-        # recency lags and moving stats
+        # recency features on (pre-cap) total_amount
         X["lag1"] = X["total_amount"].shift(1).fillna(0.0)
         X["lag7"] = X["total_amount"].shift(7).fillna(0.0)
         X["ema3"] = X["total_amount"].ewm(span=3, adjust=False).mean().fillna(0.0)
@@ -153,25 +173,43 @@ def build_period_features_daily(tx: pd.DataFrame, top_k_categories: int = 10, fr
     if not feats:
         raise RuntimeError("No daily features produced. Check input data.")
 
+    # concatenate all users
     feats = pd.concat(feats, ignore_index=True)
+
+    # add time cyclic features
     feats = add_time_cyc_features(feats, "period_start", freq=freq)
+
+    # -------- GLOBAL OUTLIER CAP (after concat) --------
+    if global_cap:
+        q_global = feats["total_amount"].quantile(outlier_cap_pct)
+        q_effective = max(float(q_global), float(cap_floor))
+        feats["outlier_day"] = (feats["total_amount"] > q_effective).astype(float)
+        feats["total_amount"] = np.minimum(feats["total_amount"], q_effective)
+    else:
+        feats["outlier_day"] = (feats["total_amount"] > cap_floor).astype(float)
 
     # finalize feature columns
     non_feat = ["customer_id", "period_start", "dow", "month", "total_amount"]
-    known = set(non_feat + ["txn_count", "avg_amount", "outlier_day",
-                            "lag1", "lag7", "ema3", "ema7", "std7",
-                            "dow_sin", "dow_cos", "mon_sin", "mon_cos"])
+    known = set(
+        non_feat
+        + ["txn_count", "avg_amount", "outlier_day",
+           "lag1", "lag7", "ema3", "ema7", "std7",
+           "dow_sin", "dow_cos", "mon_sin", "mon_cos"]
+    )
     cat_cols = [c for c in feats.columns if c not in known]
-    feature_cols = ["txn_count", "avg_amount", "outlier_day",
-                    "lag1", "lag7", "ema3", "ema7", "std7"] + cat_cols + \
-                   ["dow_sin", "dow_cos", "mon_sin", "mon_cos"]
+    feature_cols = (
+        ["txn_count", "avg_amount", "outlier_day",
+         "lag1", "lag7", "ema3", "ema7", "std7"]
+        + cat_cols
+        + ["dow_sin", "dow_cos", "mon_sin", "mon_cos"]
+    )
     target_col = "total_amount"
 
     feats[feature_cols + [target_col]] = feats[feature_cols + [target_col]].fillna(0.0)
     return feats, feature_cols, target_col
 
 
-def build_sequences(feats, feature_cols, target_col, lookback=28, horizon=1, log_target=True):
+def build_sequences(feats, feature_cols, target_col, lookback=21, horizon=1, log_target=True):
     """
     Build rolling sequences per user.
     Returns X, y_log (for training), y_orig (for metrics), users, times.
@@ -206,7 +244,7 @@ def time_split(seq_time, train_ratio=0.8):
     ts = pd.to_datetime(seq_time).view(np.int64)
     thresh = np.quantile(ts, train_ratio)
     idx_tr = np.where(ts <= thresh)[0]
-    idx_va = np.where(ts > thresh)[0]
+    idx_va = np.where(ts >  thresh)[0]
     return idx_tr, idx_va
 
 
@@ -263,7 +301,7 @@ class UserBalancedBatchSampler(Sampler):
 # Model
 # =========================
 class LSTMRegressor(nn.Module):
-    def __init__(self, n_features, hidden=96, layers=2, dropout=0.25, horizon=1):
+    def __init__(self, n_features, hidden=64, layers=2, dropout=0.20, horizon=1):
         super().__init__()
         self.lstm = nn.LSTM(n_features, hidden, num_layers=layers, batch_first=True, dropout=dropout)
         self.head = nn.Sequential(
@@ -343,7 +381,8 @@ def build_train_val_loaders(cfg: CFG, tr_ds: SeqDS, va_ds: SeqDS, train_users_ar
         c_map = {u: c for u, c in zip(uniq, counts)}
         weights = np.array([1.0 / c_map[u] for u in train_users_array], dtype=np.float64)
         sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-        train_loader = DataLoader(tr_ds, batch_size=cfg.batch_size, sampler=sampler, drop_last=False)
+        train_loader = DataLoader(tr_ds, batch_size=cfg.batch_size, sampler=sampler, drop_last=False,
+                                  num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     elif cfg.sampler == "grouped":
         # user-balanced grouped sampler
         assert cfg.users_per_batch * cfg.seqs_per_user == cfg.batch_size, \
@@ -354,13 +393,40 @@ def build_train_val_loaders(cfg: CFG, tr_ds: SeqDS, va_ds: SeqDS, train_users_ar
             seqs_per_user=cfg.seqs_per_user,
             seed=cfg.seed
         )
-        train_loader = DataLoader(tr_ds, batch_sampler=ubs)
+        train_loader = DataLoader(tr_ds, batch_sampler=ubs, num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     else:
         # default shuffling
-        train_loader = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+        train_loader = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False,
+                                  num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
 
-    val_loader = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
+    val_loader = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False,
+                            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     return train_loader, val_loader
+
+
+def _subset_for_speed(cfg: CFG, X_tr, y_tr_log, y_tr, users_tr):
+    """
+    Optional subsampling for fast runs: keep top-N users by sequence count and/or cap total sequences.
+    """
+    if not cfg.fast_mode:
+        return X_tr, y_tr_log, y_tr, users_tr
+
+    # keep top-N users by occurrence
+    if cfg.keep_top_users is not None:
+        uniq, counts = np.unique(users_tr, return_counts=True)
+        order = np.argsort(-counts)  # descending
+        top_users = set(uniq[order[:cfg.keep_top_users]])
+        mask = np.array([u in top_users for u in users_tr])
+        X_tr, y_tr_log, y_tr, users_tr = X_tr[mask], y_tr_log[mask], y_tr[mask], users_tr[mask]
+        print(f"[fast] kept top {cfg.keep_top_users} users -> train seq: {len(X_tr)}")
+
+    # cap total train sequences
+    if cfg.max_train_sequences is not None and len(X_tr) > cfg.max_train_sequences:
+        idx = np.random.RandomState(cfg.seed).choice(len(X_tr), size=cfg.max_train_sequences, replace=False)
+        X_tr, y_tr_log, y_tr, users_tr = X_tr[idx], y_tr_log[idx], y_tr[idx], users_tr[idx]
+        print(f"[fast] subsampled train sequences to {cfg.max_train_sequences}")
+
+    return X_tr, y_tr_log, y_tr, users_tr
 
 
 def run_once(hparams=None):
@@ -370,13 +436,19 @@ def run_once(hparams=None):
         setattr(cfg, k, v)
 
     set_seed(cfg.seed)
+    t0 = time.time()
 
     # 1) Load data
     tx, customers, merchants = load_data(cfg.data_dir)
 
-    # 2) Build daily features
+    # 2) Build daily features (with global cap + floor)
     feats, feature_cols, target_col = build_period_features_daily(
-        tx, top_k_categories=cfg.top_k_categories, freq=cfg.freq, outlier_cap_pct=cfg.outlier_cap_pct
+        tx,
+        top_k_categories=cfg.top_k_categories,
+        freq=cfg.freq,
+        outlier_cap_pct=cfg.outlier_cap_pct,
+        global_cap=cfg.global_cap,
+        cap_floor=cfg.cap_floor
     )
     feats = feats.sort_values(["customer_id", "period_start"]).reset_index(drop=True)
 
@@ -392,7 +464,10 @@ def run_once(hparams=None):
     X_tr, X_va = X_raw[idx_tr], X_raw[idx_va]
     y_tr_log, y_va_log = y_log[idx_tr], y_log[idx_va]
     y_tr, y_va = y_orig[idx_tr], y_orig[idx_va]
-    train_users_array = np.array(users)[idx_tr]
+    users_tr = np.array(users)[idx_tr]
+
+    # Optional subsampling for speed
+    X_tr, y_tr_log, y_tr, users_tr = _subset_for_speed(cfg, X_tr, y_tr_log, y_tr, users_tr)
 
     # 5) Scale features using train only
     B, T, F = X_tr.shape
@@ -407,12 +482,12 @@ def run_once(hparams=None):
     # 6) DataLoaders (with user-balanced strategy)
     tr_ds = SeqDS(X_tr, y_tr_log, y_tr)
     va_ds = SeqDS(X_va, y_va_log, y_va)
-    train_loader, val_loader = build_train_val_loaders(cfg, tr_ds, va_ds, train_users_array)
+    train_loader, val_loader = build_train_val_loaders(cfg, tr_ds, va_ds, users_tr)
 
     print(f"Train sequences: {len(tr_ds)} | Val sequences: {len(va_ds)} | Features: {len(feature_cols)}")
     if cfg.sampler != "none":
-        print(f"Sampler: {cfg.sampler} | "
-              f"users_per_batch={cfg.users_per_batch} | seqs_per_user={cfg.seqs_per_user}")
+        print(f"Sampler: {cfg.sampler} | users_per_batch={cfg.users_per_batch} | seqs_per_user={cfg.seqs_per_user}")
+    print(f"[fast_mode={cfg.fast_mode}] epochs={cfg.epochs}, hidden={cfg.hidden_size}, lookback={cfg.lookback}")
 
     # 7) Model / Optim / Loss / Scheduler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -463,16 +538,17 @@ def run_once(hparams=None):
                 print("Early stopping.")
                 break
 
+    t1 = time.time()
+    print(f"Total training time: {(t1 - t0):.1f}s")
     return save_path
 
 
 def main():
-    # Optional tiny sweep; comment out entries to make it quicker.
+    # Single fast trial by default. Add more dicts here if you want quick sweeps.
     trials = [
         {},  # default CFG
-        {"hidden_size": 128, "dropout": 0.2, "lr": 3e-4},
-        {"hidden_size": 64,  "dropout": 0.3, "lr": 7e-4, "weight_decay": 5e-5,
-         "sampler": "grouped", "users_per_batch": 8, "seqs_per_user": 16},
+        # Example alt trial toggles (uncomment to try a bit longer):
+        # {"hidden_size": 96, "epochs": 16, "fast_mode": True, "lr": 3e-4},
     ]
     best = None
     for i, hp in enumerate(trials, 1):
