@@ -1,7 +1,7 @@
 import os
 import joblib
 import pandas as pd
-from config.settings import settings
+from config import settings
 from .ranking_pipeline import RankingPipeline
 
 MODEL_FILE = os.path.join(settings.DATA_MODELS, "service_pipeline.pkl")
